@@ -1778,7 +1778,8 @@ static const char deprecated_msg[] =
 	"Contact linux-ext4@vger.kernel.org if you think we should keep it.\n";
 
 #ifdef CONFIG_QUOTA
-static int set_qf_name(struct super_block *sb, int qtype, substring_t *args)
+static int set_qf_name(struct super_block *sb, int qtype,
+		       struct fs_parameter *param)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	char *qname, *old_qname = get_qf_name(sb, sbi, qtype);
@@ -1795,7 +1796,7 @@ static int set_qf_name(struct super_block *sb, int qtype, substring_t *args)
 			 "ignored when QUOTA feature is enabled");
 		return 1;
 	}
-	qname = match_strdup(args);
+	qname = kmemdup_nul(param->string, param->size, GFP_KERNEL);
 	if (!qname) {
 		ext4_msg(sb, KERN_ERR,
 			"Not enough memory for storing quotafile name");
@@ -1984,35 +1985,49 @@ static int ext4_sb_read_encoding(const struct ext4_super_block *es,
 }
 #endif
 
-static int handle_mount_opt(struct super_block *sb, char *opt, int token,
-			    substring_t *args, unsigned long *journal_devnum,
-			    unsigned int *journal_ioprio, int is_remount)
+struct ext4_fs_context {
+	unsigned long journal_devnum;
+	unsigned int journal_ioprio;
+};
+
+static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 {
-	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct ext4_fs_context *ctx = fc->fs_private;
+	struct ext4_sb_info *sbi = fc->s_fs_info;
+	struct super_block *sb = sbi->s_sb;
 	const struct mount_opts *m;
+	struct fs_parse_result result;
 	kuid_t uid;
 	kgid_t gid;
-	int arg = 0;
+	int token;
+
+	token = fs_parse(fc, ext4_param_specs, param, &result);
+	if (token < 0)
+		return token;
 
 #ifdef CONFIG_QUOTA
-	if (token == Opt_usrjquota)
-		return set_qf_name(sb, USRQUOTA, &args[0]);
-	else if (token == Opt_grpjquota)
-		return set_qf_name(sb, GRPQUOTA, &args[0]);
-	else if (token == Opt_offusrjquota)
-		return clear_qf_name(sb, USRQUOTA);
-	else if (token == Opt_offgrpjquota)
-		return clear_qf_name(sb, GRPQUOTA);
+	if (token == Opt_usrjquota) {
+		if (!*param->string)
+			return clear_qf_name(sb, USRQUOTA);
+		else
+			return set_qf_name(sb, USRQUOTA, param);
+	} else if (token == Opt_grpjquota) {
+		if (!*param->string)
+			return clear_qf_name(sb, GRPQUOTA);
+		else
+			return set_qf_name(sb, GRPQUOTA, param);
+	}
 #endif
 	switch (token) {
 	case Opt_noacl:
 	case Opt_nouser_xattr:
-		ext4_msg(sb, KERN_WARNING, deprecated_msg, opt, "3.5");
+		ext4_msg(sb, KERN_WARNING, deprecated_msg, param->key, "3.5");
 		break;
 	case Opt_sb:
 		return 1;	/* handled by get_sb_block() */
 	case Opt_removed:
-		ext4_msg(sb, KERN_WARNING, "Ignoring removed %s option", opt);
+		ext4_msg(sb, KERN_WARNING, "Ignoring removed %s option",
+			 param->key);
 		return 1;
 	case Opt_abort:
 		sbi->s_mount_flags |= EXT4_MF_FS_ABORTED;
@@ -2026,6 +2041,11 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
 	case Opt_nolazytime:
 		sb->s_flags &= ~SB_LAZYTIME;
 		return 1;
+	case Opt_errors:
+	case Opt_data:
+	case Opt_data_err:
+	case Opt_jqfmt:
+		token = result.uint_32;
 	}
 
 	for (m = ext4_mount_opts; m->token != Opt_err; m++)
@@ -2034,25 +2054,23 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
 
 	if (m->token == Opt_err) {
 		ext4_msg(sb, KERN_ERR, "Unrecognized mount option \"%s\" "
-			 "or missing value", opt);
+			 "or missing value", param->key);
 		return -1;
 	}
 
 	if ((m->flags & MOPT_NO_EXT2) && IS_EXT2_SB(sb)) {
 		ext4_msg(sb, KERN_ERR,
-			 "Mount option \"%s\" incompatible with ext2", opt);
+			 "Mount option \"%s\" incompatible with ext2",
+			 param->string);
 		return -1;
 	}
 	if ((m->flags & MOPT_NO_EXT3) && IS_EXT3_SB(sb)) {
 		ext4_msg(sb, KERN_ERR,
-			 "Mount option \"%s\" incompatible with ext3", opt);
+			 "Mount option \"%s\" incompatible with ext3",
+			 param->string);
 		return -1;
 	}
 
-	if (args->from && !(m->flags & MOPT_STRING) && match_int(args, &arg))
-		return -1;
-	if (args->from && (m->flags & MOPT_GTE0) && (arg < 0))
-		return -1;
 	if (m->flags & MOPT_EXPLICIT) {
 		if (m->mount_opt & EXT4_MOUNT_DELALLOC) {
 			set_opt2(sb, EXPLICIT_DELALLOC);
@@ -2070,115 +2088,104 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
 	}
 
 	if (m->flags & MOPT_NOSUPPORT) {
-		ext4_msg(sb, KERN_ERR, "%s option not supported", opt);
+		ext4_msg(sb, KERN_ERR, "%s option not supported",
+			 param->key);
 	} else if (token == Opt_commit) {
-		if (arg == 0)
-			arg = JBD2_DEFAULT_MAX_COMMIT_AGE;
-		else if (arg > INT_MAX / HZ) {
+		if (result.uint_32 == 0)
+			sbi->s_commit_interval = JBD2_DEFAULT_MAX_COMMIT_AGE;
+		else if (result.uint_32 > INT_MAX / HZ) {
 			ext4_msg(sb, KERN_ERR,
 				 "Invalid commit interval %d, "
 				 "must be smaller than %d",
-				 arg, INT_MAX / HZ);
+				 result.uint_32, INT_MAX / HZ);
 			return -1;
 		}
-		sbi->s_commit_interval = HZ * arg;
+		sbi->s_commit_interval = HZ * result.uint_32;
 	} else if (token == Opt_debug_want_extra_isize) {
-		if ((arg & 1) ||
-		    (arg < 4) ||
-		    (arg > (sbi->s_inode_size - EXT4_GOOD_OLD_INODE_SIZE))) {
+		if ((result.uint_32 & 1) ||
+		    (result.uint_32 < 4) ||
+		    (result.uint_32 >
+		     (sbi->s_inode_size - EXT4_GOOD_OLD_INODE_SIZE))) {
 			ext4_msg(sb, KERN_ERR,
-				 "Invalid want_extra_isize %d", arg);
+				 "Invalid want_extra_isize %d", result.uint_32);
 			return -1;
 		}
-		sbi->s_want_extra_isize = arg;
+		sbi->s_want_extra_isize = result.uint_32;
 	} else if (token == Opt_max_batch_time) {
-		sbi->s_max_batch_time = arg;
+		sbi->s_max_batch_time = result.uint_32;
 	} else if (token == Opt_min_batch_time) {
-		sbi->s_min_batch_time = arg;
+		sbi->s_min_batch_time = result.uint_32;
 	} else if (token == Opt_inode_readahead_blks) {
-		if (arg && (arg > (1 << 30) || !is_power_of_2(arg))) {
+		if (result.uint_32 &&
+		    (result.uint_32 > (1 << 30) ||
+		     !is_power_of_2(result.uint_32))) {
 			ext4_msg(sb, KERN_ERR,
 				 "EXT4-fs: inode_readahead_blks must be "
 				 "0 or a power of 2 smaller than 2^31");
 			return -1;
 		}
-		sbi->s_inode_readahead_blks = arg;
+		sbi->s_inode_readahead_blks = result.uint_32;
 	} else if (token == Opt_init_itable) {
 		set_opt(sb, INIT_INODE_TABLE);
-		if (!args->from)
-			arg = EXT4_DEF_LI_WAIT_MULT;
-		sbi->s_li_wait_mult = arg;
+		sbi->s_li_wait_mult = EXT4_DEF_LI_WAIT_MULT;
+		if (param->type == fs_value_is_string)
+			sbi->s_li_wait_mult = result.uint_32;
 	} else if (token == Opt_max_dir_size_kb) {
-		sbi->s_max_dir_size_kb = arg;
+		sbi->s_max_dir_size_kb = result.uint_32;
 	} else if (token == Opt_stripe) {
-		sbi->s_stripe = arg;
+		sbi->s_stripe = result.uint_32;
 	} else if (token == Opt_resuid) {
-		uid = make_kuid(current_user_ns(), arg);
+		uid = make_kuid(current_user_ns(), result.uint_32);
 		if (!uid_valid(uid)) {
-			ext4_msg(sb, KERN_ERR, "Invalid uid value %d", arg);
+			ext4_msg(sb, KERN_ERR, "Invalid uid value %d",
+				 result.uint_32);
 			return -1;
 		}
 		sbi->s_resuid = uid;
 	} else if (token == Opt_resgid) {
-		gid = make_kgid(current_user_ns(), arg);
+		gid = make_kgid(current_user_ns(), result.uint_32);
 		if (!gid_valid(gid)) {
-			ext4_msg(sb, KERN_ERR, "Invalid gid value %d", arg);
+			ext4_msg(sb, KERN_ERR, "Invalid gid value %d",
+				 result.uint_32);
 			return -1;
 		}
 		sbi->s_resgid = gid;
 	} else if (token == Opt_journal_dev) {
-		if (is_remount) {
+		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
 			ext4_msg(sb, KERN_ERR,
 				 "Cannot specify journal on remount");
 			return -1;
 		}
-		*journal_devnum = arg;
+		ctx->journal_devnum = result.uint_32;
 	} else if (token == Opt_journal_path) {
-		char *journal_path;
 		struct inode *journal_inode;
 		struct path path;
 		int error;
 
-		if (is_remount) {
+		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
 			ext4_msg(sb, KERN_ERR,
 				 "Cannot specify journal on remount");
 			return -1;
 		}
-		journal_path = match_strdup(&args[0]);
-		if (!journal_path) {
-			ext4_msg(sb, KERN_ERR, "error: could not dup "
-				"journal device string");
-			return -1;
-		}
 
-		error = kern_path(journal_path, LOOKUP_FOLLOW, &path);
+		error = fs_lookup_param(fc, param, 1, &path);
 		if (error) {
 			ext4_msg(sb, KERN_ERR, "error: could not find "
-				"journal device path: error %d", error);
-			kfree(journal_path);
+				 "journal device path");
 			return -1;
 		}
 
 		journal_inode = d_inode(path.dentry);
-		if (!S_ISBLK(journal_inode->i_mode)) {
-			ext4_msg(sb, KERN_ERR, "error: journal path %s "
-				"is not a block device", journal_path);
-			path_put(&path);
-			kfree(journal_path);
-			return -1;
-		}
-
-		*journal_devnum = new_encode_dev(journal_inode->i_rdev);
+		ctx->journal_devnum = new_encode_dev(journal_inode->i_rdev);
 		path_put(&path);
-		kfree(journal_path);
 	} else if (token == Opt_journal_ioprio) {
-		if (arg > 7) {
+		if (result.uint_32 > 7) {
 			ext4_msg(sb, KERN_ERR, "Invalid journal IO priority"
 				 " (must be 0-7)");
 			return -1;
 		}
-		*journal_ioprio =
-			IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, arg);
+		ctx->journal_ioprio =
+			IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, result.uint_32);
 	} else if (token == Opt_test_dummy_encryption) {
 #ifdef CONFIG_FS_ENCRYPTION
 		sbi->s_mount_flags |= EXT4_MF_TEST_DUMMY_ENCRYPTION;
@@ -2189,7 +2196,7 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
 			 "Test dummy encryption mount option ignored");
 #endif
 	} else if (m->flags & MOPT_DATAJ) {
-		if (is_remount) {
+		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
 			if (!sbi->s_journal)
 				ext4_msg(sb, KERN_WARNING, "Remounting file system with no journal so ignoring journalled data option");
 			else if (test_opt(sb, DATA_FLAGS) != m->mount_opt) {
@@ -2231,17 +2238,22 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
 	} else if (token == Opt_data_err_ignore) {
 		sbi->s_mount_opt &= ~m->mount_opt;
 	} else {
-		if (!args->from)
-			arg = 1;
+		unsigned int set = 0;
+
+		if ((param->type == fs_value_is_flag) ||
+		    result.uint_32 > 0)
+			set = 1;
+
 		if (m->flags & MOPT_CLEAR)
-			arg = !arg;
+			set = !set;
 		else if (unlikely(!(m->flags & MOPT_SET))) {
 			ext4_msg(sb, KERN_WARNING,
-				 "buggy handling of option %s", opt);
+				 "buggy handling of option %s",
+				 param->key);
 			WARN_ON(1);
 			return -1;
 		}
-		if (arg != 0)
+		if (set != 0)
 			sbi->s_mount_opt |= m->mount_opt;
 		else
 			sbi->s_mount_opt &= ~m->mount_opt;
@@ -2254,26 +2266,60 @@ static int parse_options(char *options, struct super_block *sb,
 			 unsigned int *journal_ioprio,
 			 int is_remount)
 {
-	substring_t args[MAX_OPT_ARGS];
-	int token;
-	char *p;
+	struct ext4_fs_context ctx;
+	struct fs_parameter param;
+	struct fs_context fc;
+	int ret;
+	char *key;
 
 	if (!options)
 		return 1;
 
-	while ((p = strsep(&options, ",")) != NULL) {
-		if (!*p)
-			continue;
-		/*
-		 * Initialize args struct so we know whether arg was
-		 * found; some options take optional arguments.
-		 */
-		args[0].to = args[0].from = NULL;
-		token = match_token(p, tokens, args);
-		if (handle_mount_opt(sb, p, token, args, journal_devnum,
-				     journal_ioprio, is_remount) < 0)
-			return 0;
+	memset(&fc, 0, sizeof(fc));
+	memset(&ctx, 0, sizeof(ctx));
+	fc.fs_private = &ctx;
+	fc.s_fs_info = EXT4_SB(sb);
+
+	if (is_remount)
+		fc.purpose = FS_CONTEXT_FOR_RECONFIGURE;
+
+	while ((key = strsep(&options, ",")) != NULL) {
+		if (*key) {
+			size_t v_len = 0;
+			char *value = strchr(key, '=');
+
+			param.type = fs_value_is_flag;
+			param.string = NULL;
+
+			if (value) {
+				if (value == key)
+					continue;
+
+				*value++ = 0;
+				v_len = strlen(value);
+				param.string = kmemdup_nul(value, v_len,
+							   GFP_KERNEL);
+				if (!param.string)
+					return 0;
+				param.type = fs_value_is_string;
+			}
+
+			param.key = key;
+			param.size = v_len;
+
+			ret = handle_mount_opt(&fc, &param);
+			if (param.string)
+				kfree(param.string);
+			if (ret < 0)
+				return 0;
+		}
 	}
+
+	if (journal_devnum)
+		*journal_devnum = ctx.journal_devnum;
+	if (journal_ioprio)
+		*journal_ioprio = ctx.journal_ioprio;
+
 	return ext4_validate_options(sb);
 }
 
