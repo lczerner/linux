@@ -89,8 +89,8 @@ static void ext4_clear_request_list(void);
 static struct inode *ext4_get_journal_inode(struct super_block *sb,
 					    unsigned int journal_inum);
 static int ext4_validate_options(struct fs_context *fc);
-static int ext4_check_quota_consistency(struct fs_context *fc,
-					struct super_block *sb);
+static int ext4_check_opt_consistency(struct fs_context *fc,
+				      struct super_block *sb);
 static void ext4_apply_quota_options(struct fs_context *fc,
 				     struct super_block *sb);
 
@@ -1931,6 +1931,7 @@ struct ext4_fs_context {
 	unsigned short	qname_spec;
 	unsigned long	journal_devnum;
 	unsigned int	journal_ioprio;
+	unsigned int	opt_flags;	/* MOPT flags */
 };
 
 #ifdef CONFIG_QUOTA
@@ -2050,22 +2051,11 @@ static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 		if (token == m->token)
 			break;
 
+	ctx->opt_flags |= m->flags;
+
 	if (m->token == Opt_err) {
 		ext4_msg(NULL, KERN_ERR, "Unrecognized mount option \"%s\" "
 			 "or missing value", param->key);
-		return -EINVAL;
-	}
-
-	if ((m->flags & MOPT_NO_EXT2) && IS_EXT2_SB(sb)) {
-		ext4_msg(NULL, KERN_ERR,
-			 "Mount option \"%s\" incompatible with ext2",
-			 param->string);
-		return -EINVAL;
-	}
-	if ((m->flags & MOPT_NO_EXT3) && IS_EXT3_SB(sb)) {
-		ext4_msg(NULL, KERN_ERR,
-			 "Mount option \"%s\" incompatible with ext3",
-			 param->string);
 		return -EINVAL;
 	}
 
@@ -2305,7 +2295,7 @@ static int parse_options(char *options, struct super_block *sb,
 	if (ret < 0)
 		return 0;
 
-	ret = ext4_check_quota_consistency(&fc, sb);
+	ret = ext4_check_opt_consistency(&fc, sb);
 	if (ret < 0)
 		return 0;
 
@@ -2396,6 +2386,25 @@ err_feature:
 #else
 	return 0;
 #endif
+}
+
+static int ext4_check_opt_consistency(struct fs_context *fc,
+				      struct super_block *sb)
+{
+	struct ext4_fs_context *ctx = fc->fs_private;
+
+	if ((ctx->opt_flags & MOPT_NO_EXT2) && IS_EXT2_SB(sb)) {
+		ext4_msg(NULL, KERN_ERR,
+			 "Mount option(s) incompatible with ext2");
+		return -EINVAL;
+	}
+	if ((ctx->opt_flags & MOPT_NO_EXT3) && IS_EXT3_SB(sb)) {
+		ext4_msg(NULL, KERN_ERR,
+			 "Mount option(s) incompatible with ext3");
+		return -EINVAL;
+	}
+
+	return ext4_check_quota_consistency(fc, sb);
 }
 
 static int ext4_validate_options(struct fs_context *fc)
