@@ -1753,29 +1753,6 @@ static const match_table_t tokens = {
 	{Opt_err, NULL},
 };
 
-static ext4_fsblk_t get_sb_block(void **data)
-{
-	ext4_fsblk_t	sb_block;
-	char		*options = (char *) *data;
-
-	if (!options || strncmp(options, "sb=", 3) != 0)
-		return 1;	/* Default location */
-
-	options += 3;
-	/* TODO: use simple_strtoll with >32bit ext4 */
-	sb_block = simple_strtoul(options, &options, 0);
-	if (*options && *options != ',') {
-		printk(KERN_ERR "EXT4-fs: Invalid sb specification: %s\n",
-		       (char *) *data);
-		return 1;
-	}
-	if (*options == ',')
-		options++;
-	*data = (void *) options;
-
-	return sb_block;
-}
-
 #define DEFAULT_JOURNAL_IOPRIO (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 3))
 static const char deprecated_msg[] =
 	"Mount option \"%s\" will be removed by %s\n"
@@ -1852,6 +1829,7 @@ static const struct mount_opts {
 	{Opt_stripe, 0, MOPT_GTE0},
 	{Opt_resuid, 0, MOPT_GTE0},
 	{Opt_resgid, 0, MOPT_GTE0},
+	{Opt_sb, 0, MOPT_GTE0},
 	{Opt_journal_dev, 0, MOPT_NO_EXT2 | MOPT_GTE0},
 	{Opt_journal_path, 0, MOPT_NO_EXT2 | MOPT_STRING},
 	{Opt_journal_ioprio, 0, MOPT_NO_EXT2 | MOPT_GTE0},
@@ -1940,6 +1918,7 @@ static int ext4_sb_read_encoding(const struct ext4_super_block *es,
 #define EXT4_SPEC_s_resuid			(1 << 13)
 #define EXT4_SPEC_s_resgid			(1 << 14)
 #define EXT4_SPEC_s_commit_interval		(1 << 15)
+#define EXT4_SPEC_s_sb_block			(1 << 16)
 
 struct ext4_fs_context {
 	char		*s_qf_names[EXT4_MAXQUOTAS];
@@ -1967,6 +1946,7 @@ struct ext4_fs_context {
 	u32		s_min_batch_time;
 	kuid_t		s_resuid;
 	kgid_t		s_resgid;
+	ext4_fsblk_t	s_sb_block;
 };
 
 #ifdef CONFIG_QUOTA
@@ -2079,8 +2059,6 @@ static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_nouser_xattr:
 		ext4_msg(NULL, KERN_WARNING, deprecated_msg, param->key, "3.5");
 		break;
-	case Opt_sb:
-		return 1;	/* handled by get_sb_block() */
 	case Opt_removed:
 		ext4_msg(NULL, KERN_WARNING, "Ignoring removed %s option",
 			 param->key);
@@ -2198,6 +2176,14 @@ static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 		}
 		ctx->s_resgid = gid;
 		ctx->spec |= EXT4_SPEC_s_resgid;
+	} else if (token == Opt_sb) {
+		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
+			ext4_msg(NULL, KERN_WARNING,
+				 "Ignoring %s option on remount", param->key);
+		} else {
+			ctx->s_sb_block = result.uint_32;
+			ctx->spec |= EXT4_SPEC_s_sb_block;
+		}
 	} else if (token == Opt_journal_dev) {
 		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
 			ext4_msg(NULL, KERN_ERR,
@@ -2292,27 +2278,14 @@ static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 	return 1;
 }
 
-static int parse_options(char *options, struct super_block *sb,
-			 unsigned long *journal_devnum,
-			 unsigned int *journal_ioprio,
-			 int is_remount)
+static int parse_options(struct fs_context *fc, char *options)
 {
-	struct ext4_fs_context ctx;
 	struct fs_parameter param;
-	struct fs_context fc;
 	int ret;
 	char *key;
 
 	if (!options)
-		return 1;
-
-	memset(&fc, 0, sizeof(fc));
-	memset(&ctx, 0, sizeof(ctx));
-	fc.fs_private = &ctx;
-	fc.s_fs_info = EXT4_SB(sb);
-
-	if (is_remount)
-		fc.purpose = FS_CONTEXT_FOR_RECONFIGURE;
+		return 0;
 
 	while ((key = strsep(&options, ",")) != NULL) {
 		if (*key) {
@@ -2331,36 +2304,72 @@ static int parse_options(char *options, struct super_block *sb,
 				param.string = kmemdup_nul(value, v_len,
 							   GFP_KERNEL);
 				if (!param.string)
-					return 0;
+					return -ENOMEM;
 				param.type = fs_value_is_string;
 			}
 
 			param.key = key;
 			param.size = v_len;
 
-			ret = handle_mount_opt(&fc, &param);
+			ret = handle_mount_opt(fc, &param);
 			if (param.string)
 				kfree(param.string);
 			if (ret < 0)
-				return 0;
+				return ret;
 		}
 	}
 
-	ret = ext4_validate_options(&fc);
+	ret = ext4_validate_options(fc);
 	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int parse_apply_options(char *options, struct super_block *sb,
+			 unsigned long *journal_devnum,
+			 unsigned int *journal_ioprio,
+			 int is_remount)
+{
+	struct ext4_fs_context *ctx;
+	struct fs_context *fc;
+	int ret = -ENOMEM;
+
+	if (!options)
 		return 0;
 
-	ret = ext4_check_opt_consistency(&fc, sb);
+	fc = kzalloc(sizeof(struct fs_context), GFP_KERNEL);
+	if (!fc)
+		return ret;
+	ctx = kzalloc(sizeof(struct ext4_fs_context), GFP_KERNEL);
+	if (!ctx)
+		goto out_free;
+
+	fc->fs_private = ctx;
+	fc->s_fs_info = EXT4_SB(sb);
+
+	if (is_remount)
+		fc->purpose = FS_CONTEXT_FOR_RECONFIGURE;
+
+	ret = parse_options(fc, options);
 	if (ret < 0)
-		return 0;
+		goto out_free;
 
-	if (ctx.spec & EXT4_SPEC_JOURNAL_DEV)
-		*journal_devnum = ctx.journal_devnum;
-	if (ctx.spec & EXT4_SPEC_JOURNAL_IOPRIO)
-		*journal_ioprio = ctx.journal_ioprio;
+	ret = ext4_check_opt_consistency(fc, sb);
+	if (ret < 0)
+		goto out_free;
 
-	ext4_apply_options(&fc, sb);
-	return 1;
+	if (ctx->spec & EXT4_SPEC_JOURNAL_DEV)
+		*journal_devnum = ctx->journal_devnum;
+	if (ctx->spec & EXT4_SPEC_JOURNAL_IOPRIO)
+		*journal_ioprio = ctx->journal_ioprio;
+
+	ext4_apply_options(fc, sb);
+
+out_free:
+	kfree(ctx);
+	kfree(fc);
+	return ret;
 }
 
 static void ext4_apply_quota_options(struct fs_context *fc,
@@ -4094,16 +4103,49 @@ static void ext4_set_resv_clusters(struct super_block *sb)
 	atomic64_set(&sbi->s_resv_clusters, resv_clusters);
 }
 
-static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+static void ext4_free_sbi(struct ext4_sb_info *sbi)
 {
-	struct dax_device *dax_dev = fs_dax_get_by_bdev(sb->s_bdev);
-	char *orig_data = kstrdup(data, GFP_KERNEL);
+	if (!sbi)
+		return;
+
+	kfree(sbi->s_blockgroup_lock);
+	fs_put_dax(sbi->s_daxdev);
+	kfree(sbi);
+}
+
+static struct ext4_sb_info *ext4_alloc_sbi(struct super_block *sb)
+{
+	struct ext4_sb_info *sbi;
+
+	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+	if (!sbi)
+		return NULL;
+
+	sbi->s_daxdev = fs_dax_get_by_bdev(sb->s_bdev);
+
+	sbi->s_blockgroup_lock =
+		kzalloc(sizeof(struct blockgroup_lock), GFP_KERNEL);
+
+	if (!sbi->s_blockgroup_lock)
+		goto err_out;
+
+	sb->s_fs_info = sbi;
+	sbi->s_sb = sb;
+	return sbi;
+err_out:
+	fs_put_dax(sbi->s_daxdev);
+	kfree(sbi);
+	return NULL;
+}
+
+static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb,
+			     int silent)
+{
 	struct buffer_head *bh, **group_desc;
 	struct ext4_super_block *es = NULL;
-	struct ext4_sb_info *sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct flex_groups **flex_groups;
 	ext4_fsblk_t block;
-	ext4_fsblk_t sb_block = get_sb_block(&data);
 	ext4_fsblk_t logical_sb_block;
 	unsigned long offset = 0;
 	unsigned long journal_devnum = 0;
@@ -4119,26 +4161,13 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	int err = 0;
 	unsigned int journal_ioprio = DEFAULT_JOURNAL_IOPRIO;
 	ext4_group_t first_not_zeroed;
+	struct ext4_fs_context *ctx = fc->fs_private;
 
-	if ((data && !orig_data) || !sbi)
-		goto out_free_base;
-
-	sbi->s_daxdev = dax_dev;
-	sbi->s_blockgroup_lock =
-		kzalloc(sizeof(struct blockgroup_lock), GFP_KERNEL);
-	if (!sbi->s_blockgroup_lock)
-		goto out_free_base;
-
-	sb->s_fs_info = sbi;
-	sbi->s_sb = sb;
 	sbi->s_inode_readahead_blks = EXT4_DEF_INODE_READAHEAD_BLKS;
-	sbi->s_sb_block = sb_block;
 	if (sb->s_bdev->bd_part)
 		sbi->s_sectors_written_start =
 			part_stat_read(sb->s_bdev->bd_part, sectors[STAT_WRITE]);
 
-	/* Cleanup superblock name */
-	strreplace(sb->s_id, '/', '!');
 
 	/* -EINVAL is default */
 	ret = -EINVAL;
@@ -4153,10 +4182,10 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	 * block sizes.  We need to calculate the offset from buffer start.
 	 */
 	if (blocksize != EXT4_MIN_BLOCK_SIZE) {
-		logical_sb_block = sb_block * EXT4_MIN_BLOCK_SIZE;
+		logical_sb_block = sbi->s_sb_block * EXT4_MIN_BLOCK_SIZE;
 		offset = do_div(logical_sb_block, blocksize);
 	} else {
-		logical_sb_block = sb_block;
+		logical_sb_block = sbi->s_sb_block;
 	}
 
 	if (!(bh = sb_bread_unmovable(sb, logical_sb_block))) {
@@ -4354,8 +4383,8 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 					      GFP_KERNEL);
 		if (!s_mount_opts)
 			goto failed_mount;
-		if (!parse_options(s_mount_opts, sb, &journal_devnum,
-				   &journal_ioprio, 0)) {
+		if (parse_apply_options(s_mount_opts, sb, &journal_devnum,
+					 &journal_ioprio, 0) < 0) {
 			ext4_msg(sb, KERN_WARNING,
 				 "failed to parse options in superblock: %s",
 				 s_mount_opts);
@@ -4363,9 +4392,18 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		kfree(s_mount_opts);
 	}
 	sbi->s_def_mount_opt = sbi->s_mount_opt;
-	if (!parse_options((char *) data, sb, &journal_devnum,
-			   &journal_ioprio, 0))
+
+	/* Now check and apply options we've got in fs context */
+	err = ext4_check_opt_consistency(fc, sb);
+	if (err < 0)
 		goto failed_mount;
+
+	if (ctx->spec & EXT4_SPEC_JOURNAL_DEV)
+		journal_devnum = ctx->journal_devnum;
+	if (ctx->spec & EXT4_SPEC_JOURNAL_IOPRIO)
+		journal_ioprio = ctx->journal_ioprio;
+
+	ext4_apply_options(fc, sb);
 
 #ifdef CONFIG_UNICODE
 	if (ext4_has_feature_casefold(sb) && !sbi->s_encoding) {
@@ -4555,7 +4593,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		}
 
 		brelse(bh);
-		logical_sb_block = sb_block * EXT4_MIN_BLOCK_SIZE;
+		logical_sb_block = sbi->s_sb_block * EXT4_MIN_BLOCK_SIZE;
 		offset = do_div(logical_sb_block, blocksize);
 		bh = sb_bread_unmovable(sb, logical_sb_block);
 		if (!bh) {
@@ -5126,11 +5164,7 @@ no_journal:
 	}
 
 	if (___ratelimit(&ext4_mount_msg_ratelimit, "EXT4-fs mount"))
-		ext4_msg(sb, KERN_INFO, "mounted filesystem with%s. "
-			 "Opts: %.*s%s%s", descr,
-			 (int) sizeof(sbi->s_es->s_mount_opts),
-			 sbi->s_es->s_mount_opts,
-			 *sbi->s_es->s_mount_opts ? "; " : "", orig_data);
+		ext4_msg(sb, KERN_INFO, "mounted filesystem with%s.", descr);
 
 	if (es->s_error_count)
 		mod_timer(&sbi->s_err_report, jiffies + 300*HZ); /* 5 minutes */
@@ -5140,7 +5174,6 @@ no_journal:
 	ratelimit_state_init(&sbi->s_warning_ratelimit_state, 5 * HZ, 10);
 	ratelimit_state_init(&sbi->s_msg_ratelimit_state, 5 * HZ, 10);
 
-	kfree(orig_data);
 	return 0;
 
 cantfind_ext4:
@@ -5219,12 +5252,87 @@ failed_mount:
 	brelse(bh);
 out_fail:
 	sb->s_fs_info = NULL;
-	kfree(sbi->s_blockgroup_lock);
-out_free_base:
-	kfree(sbi);
-	kfree(orig_data);
-	fs_put_dax(dax_dev);
 	return err ? err : ret;
+}
+
+static void cleanup_ctx(struct ext4_fs_context *ctx)
+{
+	int i;
+
+	if (!ctx)
+		return;
+
+	for (i = 0; i < EXT4_MAXQUOTAS; i++) {
+		kfree(ctx->s_qf_names[i]);
+	}
+}
+
+static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+{
+	struct ext4_fs_context ctx;
+	struct ext4_sb_info *sbi;
+	struct fs_context fc;
+	const char *descr;
+	char *orig_data;
+	int ret = -ENOMEM;
+
+	orig_data = kstrdup(data, GFP_KERNEL);
+	if (data && !orig_data)
+		return -ENOMEM;
+
+	/* Cleanup superblock name */
+	strreplace(sb->s_id, '/', '!');
+
+	memset(&fc, 0, sizeof(fc));
+	memset(&ctx, 0, sizeof(ctx));
+	fc.fs_private = &ctx;
+
+	ret = parse_options(&fc, (char *) data);
+	if (ret < 0)
+		goto free_data;
+
+	sbi = ext4_alloc_sbi(sb);
+	if (!sbi) {
+		ret = -ENOMEM;
+		goto free_data;
+	}
+
+	fc.s_fs_info = sbi;
+
+	sbi->s_sb_block = 1;	/* Default super block location */
+	if (ctx.spec & EXT4_SPEC_s_sb_block)
+		sbi->s_sb_block = ctx.s_sb_block;
+
+	ret = __ext4_fill_super(&fc, sb, silent);
+	if (ret < 0)
+		goto free_sbi;
+
+	if (EXT4_SB(sb)->s_journal) {
+		if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_JOURNAL_DATA)
+			descr = " journalled data mode";
+		else if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_ORDERED_DATA)
+			descr = " ordered data mode";
+		else
+			descr = " writeback data mode";
+	} else
+		descr = "out journal";
+
+	if (___ratelimit(&ext4_mount_msg_ratelimit, "EXT4-fs mount"))
+		ext4_msg(sb, KERN_INFO, "mounted filesystem with%s. "
+			 "Opts: %.*s%s%s", descr,
+			 (int) sizeof(sbi->s_es->s_mount_opts),
+			 sbi->s_es->s_mount_opts,
+			 *sbi->s_es->s_mount_opts ? "; " : "", (char *)orig_data);
+
+	kfree(orig_data);
+	cleanup_ctx(&ctx);
+	return 0;
+free_sbi:
+	ext4_free_sbi(sbi);
+free_data:
+	kfree(orig_data);
+	cleanup_ctx(&ctx);
+	return ret;
 }
 
 /*
@@ -5822,10 +5930,9 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 	if (sbi->s_journal && sbi->s_journal->j_task->io_context)
 		journal_ioprio = sbi->s_journal->j_task->io_context->ioprio;
 
-	if (!parse_options(data, sb, NULL, &journal_ioprio, 1)) {
-		err = -EINVAL;
+	err = parse_apply_options(data, sb, NULL, &journal_ioprio, 1);
+	if (err < 0)
 		goto restore_opts;
-	}
 
 	if ((old_opts.s_mount_opt & EXT4_MOUNT_JOURNAL_CHECKSUM) ^
 	    test_opt(sb, JOURNAL_CHECKSUM)) {
