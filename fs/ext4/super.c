@@ -92,6 +92,7 @@ static int ext4_validate_options(struct fs_context *fc);
 static int ext4_check_opt_consistency(struct fs_context *fc,
 				      struct super_block *sb);
 static void ext4_apply_options(struct fs_context *fc, struct super_block *sb);
+static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param);
 
 /*
  * Lock ordering
@@ -120,6 +121,10 @@ static void ext4_apply_options(struct fs_context *fc, struct super_block *sb);
  * writepages:
  * transaction start -> page lock(s) -> i_data_sem (rw)
  */
+
+static const struct fs_context_operations ext4_context_ops = {
+	.parse_param	= ext4_parse_param,
+};
 
 #if !defined(CONFIG_EXT2_FS) && !defined(CONFIG_EXT2_FS_MODULE) && defined(CONFIG_EXT4_USE_FOR_EXT2)
 static struct file_system_type ext2_fs_type = {
@@ -2028,7 +2033,7 @@ EXT4_SET_CTX(mount_opt2);
 EXT4_SET_CTX(mount_flags);
 
 
-static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
+static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
 	struct ext4_fs_context *ctx = fc->fs_private;
 	const struct mount_opts *m;
@@ -2062,19 +2067,19 @@ static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_removed:
 		ext4_msg(NULL, KERN_WARNING, "Ignoring removed %s option",
 			 param->key);
-		return 1;
+		return 0;
 	case Opt_abort:
 		set_mount_flags(ctx, EXT4_MF_FS_ABORTED);
-		return 1;
+		return 0;
 	case Opt_i_version:
 		set_flags(ctx, SB_I_VERSION);
-		return 1;
+		return 0;
 	case Opt_lazytime:
 		set_flags(ctx, SB_LAZYTIME);
-		return 1;
+		return 0;
 	case Opt_nolazytime:
 		clear_flags(ctx, SB_LAZYTIME);
-		return 1;
+		return 0;
 	case Opt_errors:
 	case Opt_data:
 	case Opt_data_err:
@@ -2275,7 +2280,7 @@ static int handle_mount_opt(struct fs_context *fc, struct fs_parameter *param)
 		else
 			clear_mount_opt(ctx, m->mount_opt);
 	}
-	return 1;
+	return 0;
 }
 
 static int parse_options(struct fs_context *fc, char *options)
@@ -2311,7 +2316,7 @@ static int parse_options(struct fs_context *fc, char *options)
 			param.key = key;
 			param.size = v_len;
 
-			ret = handle_mount_opt(fc, &param);
+			ret = ext4_parse_param(fc, &param);
 			if (param.string)
 				kfree(param.string);
 			if (ret < 0)
