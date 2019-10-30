@@ -93,6 +93,7 @@ static int ext4_check_opt_consistency(struct fs_context *fc,
 				      struct super_block *sb);
 static void ext4_apply_options(struct fs_context *fc, struct super_block *sb);
 static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param);
+static int ext4_get_tree(struct fs_context *fc);
 
 /*
  * Lock ordering
@@ -124,6 +125,7 @@ static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param);
 
 static const struct fs_context_operations ext4_context_ops = {
 	.parse_param	= ext4_parse_param,
+	.get_tree	= ext4_get_tree,
 };
 
 #if !defined(CONFIG_EXT2_FS) && !defined(CONFIG_EXT2_FS_MODULE) && defined(CONFIG_EXT4_USE_FOR_EXT2)
@@ -5338,6 +5340,42 @@ free_data:
 	kfree(orig_data);
 	cleanup_ctx(&ctx);
 	return ret;
+}
+
+static int ext4_fill_super_fc(struct super_block *sb, struct fs_context *fc)
+{
+	struct ext4_fs_context *ctx = fc->fs_private;
+	struct ext4_sb_info *sbi;
+	int ret;
+
+	sbi = ext4_alloc_sbi(sb);
+	if (!sbi)
+		return -ENOMEM;
+
+	fc->s_fs_info = sbi;
+
+	/* Cleanup superblock name */
+	strreplace(sb->s_id, '/', '!');
+
+	sbi->s_sb_block = 1;	/* Default super block location */
+	if (ctx->spec & EXT4_SPEC_s_sb_block)
+		sbi->s_sb_block = ctx->s_sb_block;
+
+	ret = __ext4_fill_super(fc, sb, fc->sb_flags & SB_SILENT);
+	if (ret < 0)
+		goto free_sbi;
+
+	return 0;
+
+free_sbi:
+	ext4_free_sbi(sbi);
+	fc->s_fs_info = NULL;
+	return ret;
+}
+
+static int ext4_get_tree(struct fs_context *fc)
+{
+	return get_tree_bdev(fc, ext4_fill_super_fc);
 }
 
 /*
