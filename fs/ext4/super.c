@@ -5926,8 +5926,10 @@ struct ext4_mount_options {
 #endif
 };
 
-static int ext4_remount(struct super_block *sb, int *flags, char *data)
+static int __ext4_remount(struct fs_context *fc, struct super_block *sb,
+			  int *flags)
 {
+	struct ext4_fs_context *ctx = fc->fs_private;
 	struct ext4_super_block *es;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	unsigned long old_sb_flags;
@@ -5940,10 +5942,6 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 	int i, j;
 	char *to_free[EXT4_MAXQUOTAS];
 #endif
-	char *orig_data = kstrdup(data, GFP_KERNEL);
-
-	if (data && !orig_data)
-		return -ENOMEM;
 
 	/* Store the original options */
 	old_sb_flags = sb->s_flags;
@@ -5964,7 +5962,6 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 			if (!old_opts.s_qf_names[i]) {
 				for (j = 0; j < i; j++)
 					kfree(old_opts.s_qf_names[j]);
-				kfree(orig_data);
 				return -ENOMEM;
 			}
 		} else
@@ -5973,9 +5970,10 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 	if (sbi->s_journal && sbi->s_journal->j_task->io_context)
 		journal_ioprio = sbi->s_journal->j_task->io_context->ioprio;
 
-	err = parse_apply_options(data, sb, NULL, &journal_ioprio, 1);
-	if (err < 0)
-		goto restore_opts;
+	if (ctx->spec & EXT4_SPEC_JOURNAL_IOPRIO)
+		journal_ioprio = ctx->journal_ioprio;
+
+	ext4_apply_options(fc, sb);
 
 	if ((old_opts.s_mount_opt & EXT4_MOUNT_JOURNAL_CHECKSUM) ^
 	    test_opt(sb, JOURNAL_CHECKSUM)) {
@@ -6172,8 +6170,7 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 #endif
 
 	*flags = (*flags & ~SB_LAZYTIME) | (sb->s_flags & SB_LAZYTIME);
-	ext4_msg(sb, KERN_INFO, "re-mounted. Opts: %s", orig_data);
-	kfree(orig_data);
+	ext4_msg(sb, KERN_INFO, "re-mounted.");
 	return 0;
 
 restore_opts:
@@ -6195,8 +6192,49 @@ restore_opts:
 	for (i = 0; i < EXT4_MAXQUOTAS; i++)
 		kfree(to_free[i]);
 #endif
-	kfree(orig_data);
 	return err;
+}
+
+static int ext4_remount(struct super_block *sb, int *flags, char *data)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct ext4_fs_context ctx;
+	struct fs_context fc;
+	char *orig_data;
+	int ret;
+
+	orig_data = kstrdup(data, GFP_KERNEL);
+	if (data && !orig_data)
+		return -ENOMEM;
+
+	memset(&fc, 0, sizeof(fc));
+	memset(&ctx, 0, sizeof(ctx));
+
+	fc.fs_private = &ctx;
+	fc.purpose = FS_CONTEXT_FOR_RECONFIGURE;
+	fc.s_fs_info = sbi;
+
+	ret = parse_options(&fc, (char *) data);
+	if (ret < 0)
+		goto err_out;
+
+	ret = ext4_check_opt_consistency(&fc, sb);
+	if (ret < 0)
+		goto err_out;
+
+	ret = __ext4_remount(&fc, sb, flags);
+	if (ret < 0)
+		goto err_out;
+
+	ext4_msg(sb, KERN_INFO, "re-mounted. Opts: %s", orig_data);
+	cleanup_ctx(&ctx);
+	kfree(orig_data);
+	return 0;
+
+err_out:
+	cleanup_ctx(&ctx);
+	kfree(orig_data);
+	return ret;
 }
 
 #ifdef CONFIG_QUOTA
