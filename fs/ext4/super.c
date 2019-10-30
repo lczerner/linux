@@ -95,6 +95,7 @@ static void ext4_apply_options(struct fs_context *fc, struct super_block *sb);
 static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param);
 static int ext4_get_tree(struct fs_context *fc);
 static int ext4_reconfigure(struct fs_context *fc);
+static void ext4_fc_free(struct fs_context *fc);
 
 /*
  * Lock ordering
@@ -128,6 +129,7 @@ static const struct fs_context_operations ext4_context_ops = {
 	.parse_param	= ext4_parse_param,
 	.get_tree	= ext4_get_tree,
 	.reconfigure	= ext4_reconfigure,
+	.free		= ext4_fc_free,
 };
 
 #if !defined(CONFIG_EXT2_FS) && !defined(CONFIG_EXT2_FS_MODULE) && defined(CONFIG_EXT4_USE_FOR_EXT2)
@@ -1957,6 +1959,19 @@ struct ext4_fs_context {
 	kgid_t		s_resgid;
 	ext4_fsblk_t	s_sb_block;
 };
+
+static void ext4_fc_free(struct fs_context *fc)
+{
+	struct ext4_fs_context *ctx = fc->fs_private;
+	int i;
+
+	if (!ctx)
+		return;
+
+	for (i = 0; i < EXT4_MAXQUOTAS; i++)
+		kfree(ctx->s_qf_names[i]);
+	kfree(ctx);
+}
 
 #ifdef CONFIG_QUOTA
 /*
