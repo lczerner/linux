@@ -94,6 +94,7 @@ static int ext4_check_opt_consistency(struct fs_context *fc,
 static void ext4_apply_options(struct fs_context *fc, struct super_block *sb);
 static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param);
 static int ext4_get_tree(struct fs_context *fc);
+static int ext4_reconfigure(struct fs_context *fc);
 
 /*
  * Lock ordering
@@ -126,6 +127,7 @@ static int ext4_get_tree(struct fs_context *fc);
 static const struct fs_context_operations ext4_context_ops = {
 	.parse_param	= ext4_parse_param,
 	.get_tree	= ext4_get_tree,
+	.reconfigure	= ext4_reconfigure,
 };
 
 #if !defined(CONFIG_EXT2_FS) && !defined(CONFIG_EXT2_FS_MODULE) && defined(CONFIG_EXT4_USE_FOR_EXT2)
@@ -6235,6 +6237,25 @@ err_out:
 	cleanup_ctx(&ctx);
 	kfree(orig_data);
 	return ret;
+}
+
+static int ext4_reconfigure(struct fs_context *fc)
+{
+	struct super_block *sb = fc->root->d_sb;
+	int flags = fc->sb_flags;
+	int ret;
+
+	fc->s_fs_info = EXT4_SB(sb);
+
+	ret = ext4_check_opt_consistency(fc, sb);
+	if (ret < 0)
+		return ret;
+
+	ret = __ext4_remount(fc, sb, &flags);
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 #ifdef CONFIG_QUOTA
