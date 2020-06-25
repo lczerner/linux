@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/torture.h>
+#include <linux/jbd2.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Paul E. McKenney <paulmck@linux.ibm.com>");
@@ -58,8 +59,12 @@ static struct task_struct *stats_task;
 static struct task_struct **writer_tasks;
 static struct task_struct **reader_tasks;
 
-static bool lock_is_write_held;
-static bool lock_is_read_held;
+static struct buffer_head *bh;
+static struct journal_head *jh_reader;
+static struct journal_head *jh_writer;
+
+static int lock_is_write_held;
+static int lock_is_read_held;
 
 struct lock_stress_stats {
 	long n_lock_fail;
@@ -170,6 +175,30 @@ static void torture_spin_lock_write_unlock(void) __releases(torture_spinlock)
 {
 	spin_unlock(&torture_spinlock);
 }
+
+static int torture_jbd2_bit_spin_lock_write_lock(void)
+__acquires(torture_spinlock)
+{
+	jbd_lock_bh_journal_head(bh);
+	return 0;
+}
+
+static void torture_jbd2_bit_spin_lock_write_unlock(void)
+__releases(torture_spinlock)
+{
+	jbd_unlock_bh_journal_head(bh);
+}
+
+static struct lock_torture_ops jbd2_bit_spin_lock_ops = {
+	.writelock	= torture_jbd2_bit_spin_lock_write_lock,
+	.write_delay	= torture_spin_lock_write_delay,
+	.task_boost     = torture_boost_dummy,
+	.writeunlock	= torture_jbd2_bit_spin_lock_write_unlock,
+	.readlock       = NULL,
+	.read_delay     = NULL,
+	.readunlock     = NULL,
+	.name		= "jbd2_bit_spin_lock"
+};
 
 static struct lock_torture_ops spin_lock_ops = {
 	.writelock	= torture_spin_lock_write_lock,
@@ -629,15 +658,15 @@ static int lock_torture_writer(void *arg)
 
 		cxt.cur_ops->task_boost(&rand);
 		cxt.cur_ops->writelock();
-		if (WARN_ON_ONCE(lock_is_write_held))
+		if (WARN_ON_ONCE(jh_writer->b_jcount))
 			lwsp->n_lock_fail++;
-		lock_is_write_held = 1;
-		if (WARN_ON_ONCE(lock_is_read_held))
+		jh_writer->b_jcount++;
+		if (WARN_ON_ONCE(jh_reader->b_jcount))
 			lwsp->n_lock_fail++; /* rare, but... */
 
 		lwsp->n_lock_acquired++;
 		cxt.cur_ops->write_delay(&rand);
-		lock_is_write_held = 0;
+		--jh_writer->b_jcount;
 		cxt.cur_ops->writeunlock();
 
 		stutter_wait("lock_torture_writer");
@@ -665,13 +694,13 @@ static int lock_torture_reader(void *arg)
 			schedule_timeout_uninterruptible(1);
 
 		cxt.cur_ops->readlock();
-		lock_is_read_held = 1;
-		if (WARN_ON_ONCE(lock_is_write_held))
+		jh_reader->b_jcount++;
+		if (WARN_ON_ONCE(jh_writer->b_jcount))
 			lrsp->n_lock_fail++; /* rare, but... */
 
 		lrsp->n_lock_acquired++;
 		cxt.cur_ops->read_delay(&rand);
-		lock_is_read_held = 0;
+		--jh_reader->b_jcount;
 		cxt.cur_ops->readunlock();
 
 		stutter_wait("lock_torture_reader");
@@ -828,6 +857,10 @@ static void lock_torture_cleanup(void)
 		lock_torture_print_module_parms(cxt.cur_ops,
 						"End of test: SUCCESS");
 
+	kfree(jh_reader);
+	jh_reader = NULL;
+	kfree(jh_writer);
+	jh_writer = NULL;
 	kfree(cxt.lwsa);
 	cxt.lwsa = NULL;
 	kfree(cxt.lrsa);
@@ -852,6 +885,7 @@ static int __init lock_torture_init(void)
 #endif
 		&rwsem_lock_ops,
 		&percpu_rwsem_lock_ops,
+		&jbd2_bit_spin_lock_ops,
 	};
 
 	if (!torture_init_begin(torture_type, verbose))
@@ -978,6 +1012,27 @@ static int __init lock_torture_init(void)
 		firsterr = torture_stutter_init(stutter, stutter);
 		if (firsterr)
 			goto unwind;
+	}
+
+	jh_writer = kzalloc(sizeof(*jh_writer), GFP_KERNEL);
+	if (!jh_writer) {
+		VERBOSE_TOROUT_ERRSTRING("writer_tasks: Out of memory");
+		firsterr = -ENOMEM;
+		goto unwind;
+	}
+
+	jh_reader = kzalloc(sizeof(*jh_reader), GFP_KERNEL);
+	if (!jh_reader) {
+		VERBOSE_TOROUT_ERRSTRING("reader_tasks: Out of memory");
+		firsterr = -ENOMEM;
+		goto unwind;
+	}
+
+	bh = kzalloc(sizeof(*bh), GFP_KERNEL);
+	if (!bh) {
+		VERBOSE_TOROUT_ERRSTRING("reader_tasks: Out of memory");
+		firsterr = -ENOMEM;
+		goto unwind;
 	}
 
 	if (nwriters_stress) {
