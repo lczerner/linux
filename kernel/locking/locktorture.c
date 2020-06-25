@@ -194,9 +194,9 @@ static struct lock_torture_ops jbd2_bit_spin_lock_ops = {
 	.write_delay	= torture_spin_lock_write_delay,
 	.task_boost     = torture_boost_dummy,
 	.writeunlock	= torture_jbd2_bit_spin_lock_write_unlock,
-	.readlock       = NULL,
-	.read_delay     = NULL,
-	.readunlock     = NULL,
+	.readlock       = torture_spin_lock_write_lock,
+	.read_delay     = torture_spin_lock_write_delay,
+	.readunlock     = torture_spin_lock_write_unlock,
 	.name		= "jbd2_bit_spin_lock"
 };
 
@@ -658,7 +658,7 @@ static int lock_torture_writer(void *arg)
 
 		cxt.cur_ops->task_boost(&rand);
 		cxt.cur_ops->writelock();
-		if (WARN_ON_ONCE(jh_writer->b_jcount))
+		if (WARN_ON_ONCE(jh_writer->b_jcount <= 0))
 			lwsp->n_lock_fail++;
 		jh_writer->b_jcount++;
 		if (WARN_ON_ONCE(jh_reader->b_jcount))
@@ -666,7 +666,24 @@ static int lock_torture_writer(void *arg)
 
 		lwsp->n_lock_acquired++;
 		cxt.cur_ops->write_delay(&rand);
+		cxt.cur_ops->writeunlock();
+
+
+		if ((torture_random(&rand) & 0xfffff) == 0)
+			schedule_timeout_uninterruptible(1);
+		else
+			cxt.cur_ops->write_delay(&rand);
+
+
+		cxt.cur_ops->writelock();
 		--jh_writer->b_jcount;
+		if (WARN_ON_ONCE(jh_writer->b_jcount <= 0))
+			lwsp->n_lock_fail++;
+		if (WARN_ON_ONCE(jh_reader->b_jcount))
+			lwsp->n_lock_fail++; /* rare, but... */
+
+		lwsp->n_lock_acquired++;
+		cxt.cur_ops->write_delay(&rand);
 		cxt.cur_ops->writeunlock();
 
 		stutter_wait("lock_torture_writer");
@@ -684,6 +701,7 @@ static int lock_torture_writer(void *arg)
 static int lock_torture_reader(void *arg)
 {
 	struct lock_stress_stats *lrsp = arg;
+	unsigned long flag;
 	DEFINE_TORTURE_RANDOM(rand);
 
 	VERBOSE_TOROUT_STRING("lock_torture_reader task started");
@@ -693,17 +711,41 @@ static int lock_torture_reader(void *arg)
 		if ((torture_random(&rand) & 0xfffff) == 0)
 			schedule_timeout_uninterruptible(1);
 
+		cxt.cur_ops->task_boost(&rand);
 		cxt.cur_ops->readlock();
-		jh_reader->b_jcount++;
-		if (WARN_ON_ONCE(jh_writer->b_jcount))
+		flag = torture_random(&rand) % 26;
+		if (flag == BH_JournalHead)
+			flag--;
+		set_bit(flag, &bh->b_state);
+		if (WARN_ON_ONCE(jh_writer->b_jcount <= 0))
+			lrsp->n_lock_fail++;
+		if (WARN_ON_ONCE(jh_reader->b_jcount))
 			lrsp->n_lock_fail++; /* rare, but... */
 
 		lrsp->n_lock_acquired++;
 		cxt.cur_ops->read_delay(&rand);
-		--jh_reader->b_jcount;
 		cxt.cur_ops->readunlock();
 
-		stutter_wait("lock_torture_reader");
+
+		if ((torture_random(&rand) & 0xfffff) == 0)
+			schedule_timeout_uninterruptible(1);
+		else
+			cxt.cur_ops->read_delay(&rand);
+
+
+		cxt.cur_ops->readlock();
+		if (WARN_ON_ONCE(jh_writer->b_jcount <= 0))
+			lrsp->n_lock_fail++;
+		if (WARN_ON_ONCE(jh_reader->b_jcount))
+			lrsp->n_lock_fail++; /* rare, but... */
+
+		lrsp->n_lock_acquired++;
+		cxt.cur_ops->read_delay(&rand);
+		clear_bit(flag, &bh->b_state);
+		cxt.cur_ops->readunlock();
+
+		stutter_wait("lock_torture_readr");
+
 	} while (!torture_must_stop());
 	torture_kthread_stopping("lock_torture_reader");
 	return 0;
@@ -856,6 +898,8 @@ static void lock_torture_cleanup(void)
 	else
 		lock_torture_print_module_parms(cxt.cur_ops,
 						"End of test: SUCCESS");
+
+	WARN_ON(jh_writer->b_jcount != 1);
 
 	kfree(jh_reader);
 	jh_reader = NULL;
@@ -1020,6 +1064,7 @@ static int __init lock_torture_init(void)
 		firsterr = -ENOMEM;
 		goto unwind;
 	}
+	jh_writer->b_jcount = 1;
 
 	jh_reader = kzalloc(sizeof(*jh_reader), GFP_KERNEL);
 	if (!jh_reader) {
