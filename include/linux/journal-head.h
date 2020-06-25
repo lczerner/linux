@@ -31,12 +31,6 @@ struct journal_head {
 	spinlock_t b_state_lock;
 
 	/*
-	 * Reference count - see description in journal.c
-	 * [jbd_lock_bh_journal_head()]
-	 */
-	int b_jcount;
-
-	/*
 	 * Journalling list for this buffer [b_state_lock]
 	 * NOTE: We *cannot* combine this with b_modified into a bitfield
 	 * as gcc would then (which the C standard allows but which is
@@ -109,6 +103,13 @@ struct journal_head {
 
 	/* Trigger type for the committing transaction's frozen data */
 	struct jbd2_buffer_trigger_type *b_frozen_triggers;
+
+	int pad[8];
+	/*
+	 * Reference count - see description in journal.c
+	 * [jbd_lock_bh_journal_head()]
+	 */
+	int b_jcount;
 };
 
 #endif		/* JOURNAL_HEAD_H_INCLUDED */
