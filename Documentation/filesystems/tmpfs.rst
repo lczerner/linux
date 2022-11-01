@@ -86,6 +86,18 @@ use up all the memory on the machine; but enhances the scalability of
 that instance in a system with many CPUs making intensive use of it.
 
 
+tmpfs also supports quota with the following mount options
+
+========  =============================================================
+quota     Quota accounting is enabled on the mount. Tmpfs is using
+          hidden system quota files that are initialized on mount.
+          Quota limits can quota enforcement can be enabled using
+          standard quota tools.
+usrquota  Same as quota option. Exists for compatibility reasons.
+grpquota  Same as quota option. Exists for compatibility reasons.
+========  =============================================================
+
+
 tmpfs has a mount option to set the NUMA memory allocation policy for
 all files in that instance (if CONFIG_NUMA is enabled) - which can be
 adjusted on the fly via 'mount -o remount ...'
