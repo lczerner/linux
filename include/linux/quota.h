@@ -285,7 +285,11 @@ static inline void dqstats_dec(unsigned int type)
 #define DQ_FAKE_B	3	/* no limits only usage */
 #define DQ_READ_B	4	/* dquot was read into memory */
 #define DQ_ACTIVE_B	5	/* dquot is active (dquot_release not called) */
-#define DQ_LASTSET_B	6	/* Following 6 bits (see QIF_) are reserved\
+#define DQ_NO_SHRINK_B	6	/* modified dquot (not DQ_FAKE_B) is never to
+				 * be released by a shrinker. It should remain
+				 * in memory until quotas are being disabled on
+				 * unmount. */
+#define DQ_LASTSET_B	7	/* Following 6 bits (see QIF_) are reserved\
 				 * for the mask of entries set via SETQUOTA\
 				 * quotactl. They are set under dq_data_lock\
 				 * and the quota format handling dquot can\
@@ -536,6 +540,7 @@ struct quota_module_name {
 	{QFMT_VFS_OLD, "quota_v1"},\
 	{QFMT_VFS_V0, "quota_v2"},\
 	{QFMT_VFS_V1, "quota_v2"},\
+	{QFMT_MEM_ONLY, "quota_mem"},\
 	{0, NULL}}
 
 #endif /* _QUOTA_ */

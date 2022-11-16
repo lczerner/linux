@@ -67,6 +67,13 @@ config QFMT_V2
 	  also supports 64-bit inode and block quota limits. If you need this
 	  functionality say Y here.
 
+config QFMT_MEM
+	tristate "Quota in-memory format support "
+	depends on QUOTA
+	help
+	  This config option enables kernel support for in-memory quota
+	  format support.
+
 config QUOTACTL
 	bool
 	default n

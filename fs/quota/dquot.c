@@ -736,6 +736,9 @@ dqcache_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 	spin_lock(&dq_list_lock);
 	while (!list_empty(&free_dquots) && sc->nr_to_scan) {
 		dquot = list_first_entry(&free_dquots, struct dquot, dq_free);
+		if (test_bit(DQ_NO_SHRINK_B, &dquot->dq_flags) &&
+		    !test_bit(DQ_FAKE_B, &dquot->dq_flags))
+			continue;
 		remove_dquot_hash(dquot);
 		remove_free_dquot(dquot);
 		remove_inuse(dquot);
