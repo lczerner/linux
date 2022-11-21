@@ -10,6 +10,10 @@
 #include <linux/xattr.h>
 #include <linux/fs_parser.h>
 
+#if defined(CONFIG_TMPFS) && defined(CONFIG_QUOTA)
+#define SHMEM_QUOTA_TMPFS
+#endif
+
 /* inode in-kernel data */
 
 struct shmem_inode_info {
@@ -39,6 +43,12 @@ struct shmem_inode_info {
 
 struct shmem_sb_info {
 	unsigned long max_blocks;   /* How many blocks are allowed */
+#ifdef SHMEM_QUOTA_TMPFS
+	unsigned long usrquota_block_hardlimit; /* Default user quota block hard limit */
+	unsigned long usrquota_inode_hardlimit; /* Default user quota inode hard limit */
+	unsigned long grpquota_block_hardlimit; /* Default group quota block hard limit */
+	unsigned long grpquota_inode_hardlimit; /* Default group quota inode hard limit */
+#endif
 	struct percpu_counter used_blocks;  /* How many are allocated */
 	unsigned long max_inodes;   /* How many inodes are allowed */
 	unsigned long free_inodes;  /* How many are left for allocation */

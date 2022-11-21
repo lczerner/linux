@@ -88,14 +88,32 @@ that instance in a system with many CPUs making intensive use of it.
 
 tmpfs also supports quota with the following mount options
 
-========  =============================================================
-quota     Quota accounting is enabled on the mount. Tmpfs is using
-          hidden system quota files that are initialized on mount.
-          Quota limits can quota enforcement can be enabled using
-          standard quota tools.
-usrquota  Same as quota option. Exists for compatibility reasons.
-grpquota  Same as quota option. Exists for compatibility reasons.
-========  =============================================================
+======================== ====================================================
+quota                    Quota accounting is enabled on the mount. Tmpfs is
+                         using hidden system quota files that are initialized
+                         on mount. Quota limits can quota enforcement can be
+                         enabled using standard quota tools.
+usrquota                 Same as quota option. Exists for compatibility.
+grpquota                 Same as quota option. Exists for compatibility.
+usrquota_block_hardlimit Set global user quota block hard limit.
+usrquota_inode_hardlimit Set global user quota inode hard limit.
+usrquota_block_hardlimit Set global group quota block hard limit.
+usrquota_inode_hardlimit Set global group quota inode hard limit.
+======================== ====================================================
+
+Quota limit parameters accept a suffix k, m or g for kilo, mega and giga and
+can't be changed on remount. Default global quota limits are taking effect for
+any and all user/group except root the first time the quota entry for
+user/group id is being accessed - typically the first time an inode with a
+particular id ownership is being created after the mount. In other words,
+instead of the limits being initialized to zero, they are initialized with the
+particular value provided with these mount options. The limits can be changed
+for any user/group id at any time as it normally can.
+
+When any of the default quota limits are set, quota enforcement is enabled
+automatically as well.
+
+None of the quota related mount options can be set or changed on remount.
 
 
 tmpfs has a mount option to set the NUMA memory allocation policy for

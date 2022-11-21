@@ -110,6 +110,12 @@ struct shmem_falloc {
 struct shmem_options {
 	unsigned long long blocks;
 	unsigned long long inodes;
+#ifdef SHMEM_QUOTA_TMPFS
+	unsigned long usrquota_block_hardlimit;
+	unsigned long usrquota_inode_hardlimit;
+	unsigned long grpquota_block_hardlimit;
+	unsigned long grpquota_inode_hardlimit;
+#endif
 	struct mempolicy *mpol;
 	kuid_t uid;
 	kgid_t gid;
@@ -140,10 +146,6 @@ static unsigned long shmem_default_max_inodes(void)
 
 	return min(nr_pages - totalhigh_pages(), nr_pages / 2);
 }
-#endif
-
-#if defined(CONFIG_TMPFS) && defined(CONFIG_QUOTA)
-#define SHMEM_QUOTA_TMPFS
 #endif
 
 static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
@@ -271,6 +273,57 @@ static DEFINE_MUTEX(shmem_swaplist_mutex);
 
 #define SHMEM_MAXQUOTAS 2
 
+int shmem_dquot_acquire(struct dquot *dquot)
+{
+	int type, ret = 0;
+	unsigned int memalloc;
+	struct quota_info *dqopt = sb_dqopt(dquot->dq_sb);
+	struct shmem_sb_info *sbinfo = SHMEM_SB(dquot->dq_sb);
+
+
+	mutex_lock(&dquot->dq_lock);
+	memalloc = memalloc_nofs_save();
+	if (test_bit(DQ_READ_B, &dquot->dq_flags)) {
+		smp_mb__before_atomic();
+		set_bit(DQ_ACTIVE_B, &dquot->dq_flags);
+		goto out_iolock;
+	}
+
+	type = dquot->dq_id.type;
+	ret = dqopt->ops[type]->read_dqblk(dquot);
+	if (ret < 0)
+		goto out_iolock;
+	/* Set the defaults */
+	if (type == USRQUOTA) {
+		dquot->dq_dqb.dqb_bhardlimit =
+			(sbinfo->usrquota_block_hardlimit << PAGE_SHIFT);
+		dquot->dq_dqb.dqb_ihardlimit = sbinfo->usrquota_inode_hardlimit;
+	} else if (type == GRPQUOTA) {
+		dquot->dq_dqb.dqb_bhardlimit =
+			(sbinfo->grpquota_block_hardlimit << PAGE_SHIFT);
+		dquot->dq_dqb.dqb_ihardlimit = sbinfo->grpquota_inode_hardlimit;
+	}
+	/* Make sure flags update is visible after dquot has been filled */
+	smp_mb__before_atomic();
+	set_bit(DQ_READ_B, &dquot->dq_flags);
+	set_bit(DQ_ACTIVE_B, &dquot->dq_flags);
+out_iolock:
+	memalloc_nofs_restore(memalloc);
+	mutex_unlock(&dquot->dq_lock);
+	return ret;
+}
+
+const struct dquot_operations shmem_dquot_operations = {
+	.write_dquot	= dquot_commit,
+	.acquire_dquot	= shmem_dquot_acquire,
+	.release_dquot	= dquot_release,
+	.mark_dirty	= dquot_mark_dquot_dirty,
+	.write_info	= dquot_commit_info,
+	.alloc_dquot	= dquot_alloc,
+	.destroy_dquot	= dquot_destroy,
+	.get_next_id	= dquot_get_next_id,
+};
+
 /*
  * We don't have any quota files to read, or write to/from, but quota code
  * requires .quota_read and .quota_write to exist.
@@ -288,14 +341,14 @@ static ssize_t shmem_quota_read(struct super_block *sb, int type, char *data,
 }
 
 
-static int shmem_enable_quotas(struct super_block *sb)
+static int shmem_enable_quotas(struct super_block *sb, unsigned int dquot_flags)
 {
 	int type, err = 0;
 
 	sb_dqopt(sb)->flags |= DQUOT_QUOTA_SYS_FILE | DQUOT_NOLIST_DIRTY;
 	for (type = 0; type < SHMEM_MAXQUOTAS; type++) {
 		err = dquot_load_quota_sb(sb, type, QFMT_MEM_ONLY,
-					  DQUOT_USAGE_ENABLED);
+					  dquot_flags);
 		if (err)
 			goto out_err;
 	}
@@ -3559,6 +3612,10 @@ enum shmem_param {
 	Opt_inode32,
 	Opt_inode64,
 	Opt_quota,
+	Opt_usrquota_block_hardlimit,
+	Opt_usrquota_inode_hardlimit,
+	Opt_grpquota_block_hardlimit,
+	Opt_grpquota_inode_hardlimit,
 };
 
 static const struct constant_table shmem_param_enums_huge[] = {
@@ -3583,6 +3640,10 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_flag  ("quota",		Opt_quota),
 	fsparam_flag  ("usrquota",	Opt_quota),
 	fsparam_flag  ("grpquota",	Opt_quota),
+	fsparam_string("usrquota_block_hardlimit",	Opt_usrquota_block_hardlimit),
+	fsparam_string("usrquota_inode_hardlimit",	Opt_usrquota_inode_hardlimit),
+	fsparam_string("grpquota_block_hardlimit",	Opt_grpquota_block_hardlimit),
+	fsparam_string("grpquota_inode_hardlimit",	Opt_grpquota_inode_hardlimit),
 	{}
 };
 
@@ -3666,13 +3727,60 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->full_inums = true;
 		ctx->seen |= SHMEM_SEEN_INUMS;
 		break;
-	case Opt_quota:
 #ifdef CONFIG_QUOTA
+	case Opt_quota:
 		ctx->seen |= SHMEM_SEEN_QUOTA;
+		break;
+	case Opt_usrquota_block_hardlimit:
+		size = memparse(param->string, &rest);
+		if (*rest || !size)
+			goto bad_value;
+		size = DIV_ROUND_UP(size, PAGE_SIZE);
+		if (size > ULONG_MAX)
+			return invalfc(fc,
+				       "User quota block hardlimit too large.");
+		ctx->usrquota_block_hardlimit = size;
+		ctx->seen |=  SHMEM_SEEN_QUOTA;
+		break;
+	case Opt_grpquota_block_hardlimit:
+		size = memparse(param->string, &rest);
+		if (*rest || !size)
+			goto bad_value;
+		size = DIV_ROUND_UP(size, PAGE_SIZE);
+		if (size > ULONG_MAX)
+			return invalfc(fc,
+				       "Group quota block hardlimit too large.");
+		ctx->grpquota_block_hardlimit = size;
+		ctx->seen |= SHMEM_SEEN_QUOTA;
+		break;
+	case Opt_usrquota_inode_hardlimit:
+		size = memparse(param->string, &rest);
+		if (*rest || !size)
+			goto bad_value;
+		if (size > ULONG_MAX)
+			return invalfc(fc,
+				       "User quota inode hardlimit too large.");
+		ctx->usrquota_inode_hardlimit = size;
+		ctx->seen |= SHMEM_SEEN_QUOTA;
+		break;
+	case Opt_grpquota_inode_hardlimit:
+		size = memparse(param->string, &rest);
+		if (*rest || !size)
+			goto bad_value;
+		if (size > ULONG_MAX)
+			return invalfc(fc,
+				       "Group quota inode hardlimit too large.");
+		ctx->grpquota_inode_hardlimit = size;
+		ctx->seen |= SHMEM_SEEN_QUOTA;
+		break;
 #else
+	case Opt_quota:
+	case Opt_usrquota_block_hardlimit:
+	case Opt_grpquota_block_hardlimit:
+	case Opt_usrquota_inode_hardlimit:
+	case Opt_grpquota_inode_hardlimit:
 		goto unsupported_parameter;
 #endif
-		break;
 	}
 	return 0;
 
@@ -3777,6 +3885,18 @@ static int shmem_reconfigure(struct fs_context *fc)
 		err = "Cannot enable quota on remount";
 		goto out;
 	}
+
+#ifdef CONFIG_QUOTA
+#define CHANGED_LIMIT(name)						\
+	(ctx->name## _hardlimit &&					\
+	(ctx->name## _hardlimit != sbinfo->name## _hardlimit))
+
+	if (CHANGED_LIMIT(usrquota_block) || CHANGED_LIMIT(usrquota_inode) ||
+	    CHANGED_LIMIT(grpquota_block) || CHANGED_LIMIT(grpquota_inode)) {
+		err = "Cannot change global quota limit on remount";
+		goto out;
+	}
+#endif /* CONFIG_QUOTA */
 
 	if (ctx->seen & SHMEM_SEEN_HUGE)
 		sbinfo->huge = ctx->huge;
@@ -3942,11 +4062,22 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 
 #ifdef SHMEM_QUOTA_TMPFS
 	if (ctx->seen & SHMEM_SEEN_QUOTA) {
-		sb->dq_op = &dquot_operations;
+		unsigned int dquot_flags;
+
+		sb->dq_op = &shmem_dquot_operations;
 		sb->s_qcop = &dquot_quotactl_sysfile_ops;
 		sb->s_quota_types = QTYPE_MASK_USR | QTYPE_MASK_GRP;
 
-		if (shmem_enable_quotas(sb))
+		dquot_flags = DQUOT_USAGE_ENABLED;
+		/*
+		 * If any of the global quota limits are set, enable
+		 * quota enforcement
+		 */
+		if (ctx->usrquota_block_hardlimit || ctx->usrquota_inode_hardlimit ||
+		    ctx->grpquota_block_hardlimit || ctx->grpquota_inode_hardlimit)
+			dquot_flags |= DQUOT_LIMITS_ENABLED;
+
+		if (shmem_enable_quotas(sb, dquot_flags))
 			goto failed;
 	}
 #endif  /* SHMEM_QUOTA_TMPFS */
@@ -3959,6 +4090,17 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_root = d_make_root(inode);
 	if (!sb->s_root)
 		goto failed;
+
+#ifdef SHMEM_QUOTA_TMPFS
+	/*
+	 * Set quota hard limits after shmem_get_inode() to avoid setting
+	 * it for root
+	 */
+	sbinfo->usrquota_block_hardlimit = ctx->usrquota_block_hardlimit;
+	sbinfo->usrquota_inode_hardlimit = ctx->usrquota_inode_hardlimit;
+	sbinfo->grpquota_block_hardlimit = ctx->grpquota_block_hardlimit;
+	sbinfo->grpquota_inode_hardlimit = ctx->grpquota_inode_hardlimit;
+#endif  /* SHMEM_QUOTA_TMPFS */
 
 	return 0;
 
